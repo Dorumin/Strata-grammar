@@ -333,7 +333,7 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, bool keep_all = false) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -381,10 +381,12 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, keep_all ? v.count : 64));
         for (uint64_t i = 0; i < v.count; ++i) {
-            MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            MetaValue e = read_value(c, v.elem, depth + 1, keep_all);
+            // The ordinary path keeps a sample; the count is what geometry needs.  keep_all keeps every entry,
+            // which the tokenizer arrays need (a vocabulary is full of strings).
+            if (keep_all || i < 64) v.items.push_back(std::move(e));
         }
         break;
     }
@@ -426,6 +428,29 @@ public:
     const MetaValue* get(const std::string& key) const {
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
+    }
+    /// The whole array at `key`, unlike metadata()/get() which keep only the first 64 entries.  Returns "" on
+    /// success and sets `out`; otherwise the reason.  Re-walks the mmapped header, which is cheap (header only).
+    std::string full_array(const std::string& key, MetaValue& out) const {
+        try {
+            Cursor c(base_, size_);
+            c.read<uint32_t>();   // magic
+            c.read<uint32_t>();   // version
+            c.read<uint64_t>();   // n_tensors
+            const uint64_t n_kv = c.read<uint64_t>();
+            for (uint64_t i = 0; i < n_kv; ++i) {
+                std::string k = c.str();
+                const MetaType t = (MetaType)c.read<uint32_t>();
+                if (k == key) {
+                    out = read_value(c, t, 0, true);
+                    return {};
+                }
+                read_value(c, t);
+            }
+        } catch (const std::exception& e) {
+            return e.what();
+        }
+        return "GGUF: no metadata key '" + key + "'";
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 

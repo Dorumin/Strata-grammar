@@ -507,10 +507,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(dflash2_attn_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dflash2_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 
+  # Grammar-constrained decoding: llama.cpp's GBNF algorithm (MIT, third_party/strata-llama/LICENSE), adapted to a
+  # small vocabulary interface (src/grammar/llama_grammar.h).  Host C++ only -- no GPU code: it produces the per-step
+  # "may this token be sampled" table that the sampler applies as a logit bias.  Inert until a request carries a grammar.
+  add_library(strata_grammar STATIC
+    src/grammar/llama_grammar.cpp
+    src/grammar/grammar_vocab.cpp
+    src/grammar/grammar.cpp)
+  target_include_directories(strata_grammar PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/grammar
+                                          PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(strata_grammar PRIVATE strata_warnings)
+  if(STRATA_BUILD_TESTS)
+    # the grammar core against an in-memory vocabulary: no model, no GPU
+    add_executable(strata_grammar_test src/grammar/grammar_test.cpp)
+    target_link_libraries(strata_grammar_test PRIVATE strata_grammar)
+    add_test(NAME strata_grammar_test COMMAND strata_grammar_test)
+  endif()
+
   add_executable(strata src/program/generate.cpp)
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec strata_grammar ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_HIP)
     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first
     # use (main() adds that folder to the DLL search first) so `strata.exe --version` works from the package folder.  amdhip64_7.dll and the

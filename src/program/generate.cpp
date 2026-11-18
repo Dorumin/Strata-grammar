@@ -33,6 +33,8 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
 #include "strata/core/dma_batch.hpp"
+#include "grammar.h"        // grammar-constrained decoding (src/grammar, linked as strata_grammar)
+#include "grammar_vocab.h"
 #include "strata/program/adaptive_range.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/core/device.hpp"
@@ -3530,6 +3532,35 @@ static void exit_if_gpu_fatal(const std::string& err) {
     }
 }
 
+// A GEN key's value cannot hold a space, so a grammar travels base64url-encoded: `grammar=b64:<base64url>`.  `=`
+// padding is fine (the value is everything after the first `=`); `-` and `_` stand for `+` and `/`.
+static bool decode_base64url(const std::string& in, std::string& out) {
+    out.clear();
+    static int8_t rev[256];
+    static const bool ready = [] {
+        for (int i = 0; i < 256; ++i) rev[i] = -1;
+        const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for (int i = 0; i < 64; ++i) rev[(unsigned char) a[i]] = (int8_t) i;
+        return true;
+    }();
+    (void) ready;
+    out.reserve(in.size() * 3 / 4 + 2);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char ch : in) {
+        if (ch == '=') break;
+        const int8_t v = rev[(unsigned char) ch];
+        if (v < 0) return false;
+        acc = (acc << 6) | (uint32_t) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char) ((acc >> bits) & 0xFF));
+        }
+    }
+    return true;
+}
+
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
 #else
@@ -4790,6 +4821,13 @@ int main(int argc, char** argv) {
         if (n > 0 && n < o.adapt_every && wr > 0) { o.adapt_warm_every = n; o.adapt_warm_rounds = wr; }
     }
     strata::core::layer_set_shared_early(!o.shared_late);
+    // Grammar-constrained decoding: the vocabulary the GBNF engine needs (each token's piece) is read from the model's
+    // metadata shard the first time a request carries a grammar, so a serve that never receives one does no extra I/O
+    // or work.  `supported` is what INFO reports and what a grammar request is refused on.
+    strata::grammar::GrammarVocab grammar_vocab;
+    bool grammar_vocab_loaded = false;
+    bool grammar_supported = false;
+    std::string grammar_vocab_err;
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
@@ -4804,6 +4842,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), why.c_str());
                     return 2;
                 }
+                // The tokenizer arrays live in the same shard.  Their presence is the whole grammar capability
+                // check: the pieces are only parsed on the first request that needs them.
+                if (const strata::MetaValue* tv = meta.get("tokenizer.ggml.tokens"))
+                    grammar_supported = tv->type == strata::MetaType::ARRAY && tv->count != 0;
             }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
@@ -15023,7 +15065,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g grammar=%d%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -15041,6 +15083,7 @@ int main(int argc, char** argv) {
                         (long long) o.prefill_chunk, sp.stage_count(),
                         (long long) strata::prefill::Prefill::stream_all_min_tokens(),
                         strata::prefill::Prefill::pipe_setting(),
+                        grammar_supported ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
@@ -15198,7 +15241,9 @@ int main(int argc, char** argv) {
             }
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
-        std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
+        // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too
+        // (BDONE hold); "grammar": GEN grammar=<b64> is understood and this model's tokenizer can serve it
+        std::printf("READY %lld stop hold holdb%s\n", (long long) o.max_context, grammar_supported ? " grammar" : "");
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -17075,6 +17120,10 @@ int main(int argc, char** argv) {
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
+            // grammar-constrained decoding: the GBNF text itself (base64url, so it holds no spaces) and its root rule
+            std::string req_grammar_text;
+            std::string req_grammar_root = "root";
+            bool req_grammar_bad = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -17117,6 +17166,15 @@ int main(int argc, char** argv) {
                             p = c + 1;
                         }
                     }
+                    else if (key == "grammar") {
+                        const std::string val = tok.substr(eq + 1);
+                        if (val.rfind("b64:", 0) != 0 || !decode_base64url(val.substr(4), req_grammar_text) ||
+                            req_grammar_text.find('\0') != std::string::npos) {
+                            req_grammar_text.clear();
+                            req_grammar_bad = true;
+                        }
+                    }
+                    else if (key == "grammar_root") req_grammar_root = tok.substr(eq + 1);
                     else if (key == "min_p") req_min_p = fv;
                     else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
@@ -17165,6 +17223,48 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // Grammar-constrained decoding: parse the request's GBNF here, so a bad grammar is a request error and
+            // never a decode that runs with half a mask.  The vocabulary is read on the first grammar request only.
+            std::unique_ptr<strata::grammar::Grammar> req_grammar;
+            std::vector<uint8_t> req_grammar_allowed;   // 1/0 per token id: reused every round
+            std::vector<float> req_grammar_bias;        // the request's bias, or zeros, widened to the vocabulary
+            if (!req_grammar_text.empty() || req_grammar_bad) {
+                if (req_grammar_bad) {
+                    std::printf("ERR grammar: the value must be b64:<base64url>\n");
+                    continue;
+                }
+                if (!grammar_supported) {
+                    std::printf("ERR grammar: this engine has no tokenizer pieces for the model\n");
+                    continue;
+                }
+                if (!grammar_vocab_loaded) {
+                    grammar_vocab_loaded = true;
+                    if (!strata::grammar::load_vocab_from_gguf(o.native_shards.front(), o.eos_ids, grammar_vocab,
+                                                               grammar_vocab_err)) {
+                        grammar_supported = false;   // one clear refusal, never a wrong constraint
+                        std::printf("ERR grammar: cannot read the tokenizer: %s\n", grammar_vocab_err.c_str());
+                        continue;
+                    }
+                    if (grammar_vocab.n_vocab != (int32_t) n_vocab) {
+                        grammar_supported = false;
+                        std::printf("ERR grammar: the tokenizer lists %d pieces and the model head %lld; they disagree\n",
+                                    grammar_vocab.n_vocab, (long long) n_vocab);
+                        continue;
+                    }
+                }
+                std::string gerr;
+                req_grammar = strata::grammar::Grammar::parse(req_grammar_text, req_grammar_root, grammar_vocab, gerr);
+                if (!req_grammar) {
+                    std::printf("ERR grammar: %s\n", gerr.c_str());
+                    continue;
+                }
+                req_grammar_bias = req_bias.empty() ? std::vector<float>((size_t) n_vocab, 0.0f) : req_bias;
+                // Refuse a grammar this vocabulary cannot serve now, rather than discovering it mid-decode.
+                if (!req_grammar->fill_allowed(req_grammar_allowed, gerr)) {
+                    std::printf("ERR grammar: %s\n", gerr.c_str());
+                    continue;
+                }
+            }
             // --draft auto: this request's drafter.  Without the DFlash2 drafter loaded every request uses the MTP, as before.
             uint64_t bandit_key = 0;
             if (use_df2 && o.draft_auto) {
@@ -19578,7 +19678,8 @@ int main(int argc, char** argv) {
             // and a window row computes what it would in any other window, so every emitted token is the serial loop's
             // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
             bool pl_ran = false;
-            const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
+            // (a grammar request decodes serially: its per-step mask is exact for one row, and the pipeline runs windows ahead)
+            const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok && !req_grammar;
             const char* pl_serial = !pl_want ? nullptr
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
@@ -20302,7 +20403,7 @@ int main(int argc, char** argv) {
             while (!pl_ran && !cancelled && produced_n < cap_now()) {
                 int T = 1;
                 policy.set_context(p);
-                const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
+                const bool merged = !req_grammar && first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 bool from_sfx = false;
                 int sfx_pad = 0;      // a learning stretch's lookup window longer than the proposal: the filler rows (DraftPolicy::Pick::pad)
                 int sfx_match = 0;
@@ -20430,6 +20531,12 @@ int main(int argc, char** argv) {
                 if (dc_learning && draft_on && !first_window && !merged && !from_sfx && chain_n == 0 && !gated_proposal && !(use_mtp && !req_df2 && mtp.prob())) {
                     const int sx = policy.explore_window(T, std::min<int>(S_mtp, (int) drafts.size() + 1));
                     if (sx > 0 && p + sx <= o.max_context) { T = sx; win_forced = true; }
+                }
+                // A grammar's allowed set is exact for the NEXT token only: every later row of a speculative window was
+                // drawn without knowing what row 0 would be.  One row a round keeps every emitted token constrained.
+                if (req_grammar) {
+                    chain_n = 0;
+                    T = 1;
                 }
                 const int T_mtp = T;
                 T += chain_n;
@@ -20623,6 +20730,22 @@ int main(int argc, char** argv) {
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                if (req_grammar) {
+                    // The step's allowed set, as a full-vocabulary bias: every token the grammar refuses gets -inf.
+                    // The request's own logit_bias (if any) is kept on the tokens it allows.
+                    std::string gerr;
+                    if (!req_grammar->fill_allowed(req_grammar_allowed, gerr)) {
+                        std::printf("ERR grammar: %s\n", gerr.c_str());
+                        return 1;
+                    }
+                    const float neg = -std::numeric_limits<float>::infinity();
+                    for (size_t i = 0; i < req_grammar_bias.size(); ++i)
+                        req_grammar_bias[i] = req_grammar_allowed[i] ? (req_bias.empty() ? 0.0f : req_bias[i]) : neg;
+                    if (!ver.set_logit_bias(req_grammar_bias, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
@@ -20698,6 +20821,15 @@ int main(int argc, char** argv) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                if (req_grammar) {   // the grammar follows the tokens this window emits (with T = 1, exactly one)
+                    std::string gerr;
+                    for (int i = 0; i <= a; ++i)
+                        if (!req_grammar->accept(outv[(size_t) i], gerr)) {
+                            if (adapt_thr.joinable()) adapt_thr.join();
+                            std::printf("ERR grammar: %s\n", gerr.c_str());
+                            return 1;
+                        }
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();

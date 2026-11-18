@@ -547,9 +547,15 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   there a call for an undeclared name is returned as a `tool_use`: Claude Code runs it, where text ended the turn.
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
-  work and remote ones are refused. This is schema prompting followed by server validation, not grammar-constrained
-  decoding, with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
-  without it the answer is only checked to be one JSON object. Malformed output returns **502** with
+  work and remote ones are refused. On a CUDA/HIP engine with a native pack, a `json_schema` the converter understands is
+  also turned into a GBNF grammar and the engine masks every token the grammar refuses, so the answer is valid by
+  construction; the validator still runs. A schema with `pattern`, `format`, numeric or length bounds,
+  `additionalProperties` schemas, remote references or more than four optional properties is not converted: it keeps prompt
+  then validation. `json_object` always keeps prompt then validation, because "any JSON object" needs arbitrary keys and a
+  grammar that allows any key can repeat one. A raw GBNF `grammar` string is accepted on both routes
+  ([GRAMMAR.md](GRAMMAR.md)); grammar requests decode one row per round (no speculative windows) and are refused with
+  tools or MCP. One generation per request. `jsonschema` is used when installed
+  (`python -m pip install "jsonschema>=4.23,<5"`); without it the answer is only checked to be one JSON object. Malformed output returns **502** with
   `error.code: structured_output_failed`, an invalid schema **400**. JSON formats combined with tools or MCP are refused.
   Streaming buffers the answer and emits content only after validation. Math answers often hold LaTeX such as `\alpha`, which is
   not a valid JSON escape. Add `"repair_latex_escapes": true` to the `response_format` (or to `text.format` on `/v1/responses`) and,

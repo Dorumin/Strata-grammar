@@ -65,7 +65,8 @@ class SplitGenKeys(unittest.TestCase):
             self.assertNotIn("hold", line)
         self.assertNotIn("hold", parser_keys())
         gen = (ROOT / "src" / "program" / "generate.cpp").read_text(encoding="utf-8")
-        self.assertIn('"READY %lld stop hold holdb\\n"', gen)      # the engine that does take it says both
+        self.assertIn('"READY %lld stop hold holdb%s\\n"', gen)    # the engine that does take it says both (and appends
+                                                                   # capability words such as "grammar" when it has them)
         self.assertIn('"hold" in f[2:]', (ROOT / "serve" / "server.py").read_text(encoding="utf-8"))   # and the server reads the word, not the engine's name
 
     def test_the_keys_sent_to_a_split_engine_are_accepted_by_its_parser(self):

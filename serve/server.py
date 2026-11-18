@@ -85,6 +85,8 @@ from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import grammar as grammar_api  # noqa: E402
+from serve import gbnf as gbnf_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -1111,6 +1113,7 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_hold = False            # the engine takes GEN hold=N:ID (READY <ctx> ... hold)
         self.can_hold_batch = False      # ... and its --batch slots end at the hold too, BDONE hold (READY ... holdb)
+        self.can_grammar = False         # ... and it constrains decoding to a GBNF grammar (READY ... grammar)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
@@ -1196,6 +1199,7 @@ class StrataEngine:
                 self.can_stop = "stop" in f[2:]
                 self.can_hold = "hold" in f[2:]
                 self.can_hold_batch = "holdb" in f[2:]
+                self.can_grammar = "grammar" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -1662,7 +1666,9 @@ class StrataEngine:
             if ids:
                 # only these ids are printed; the engine's comma-separated list, renormalised below
                 keys += " allowed=" + ",".join(str(i) for i in ids)
-        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
+        # a GBNF grammar (constrained decoding): the engine masks every token the grammar refuses
+        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias")) \
+            + grammar_api.engine_key(sampling.get("grammar"))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -2675,7 +2681,10 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         refuse_for_split(self, sampling or {})
-        if getattr(self, "batch", 0):
+        # A grammar request decodes on the solo path even on a --batch engine: the mask is exact for the next token
+        # and a slot's windows run ahead of it (a request promoted into a slot would silently lose the constraint).
+        # Other requests queue behind it on the existing FIFO turn.
+        if getattr(self, "batch", 0) and not (sampling or {}).get("grammar"):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
@@ -5848,8 +5857,11 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            # constrained_decoding: the engine masks tokens to the grammar (a raw `grammar` GBNF, or the schema the
+            # route converts); without it answers are prompted for and validated afterwards.
+            "structured_output": {"formats": ["json_object", "json_schema"],
+                                  "method": "engine_grammar" if grammar_api.available(self.engine) else "prompt_and_validate",
+                                  "constrained_decoding": grammar_api.available(self.engine), "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -8673,6 +8685,19 @@ def make_handler(svc: Service):
                     raise ValueError(f"allowed_token_ids: {bad[0]} is outside the vocabulary "
                                      f"(0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
+            # Grammar-constrained decoding (serve/grammar.py): normalized and refused here, before anything streams.
+            grammar_api.validate_request(req, svc.engine)
+            if req.get("grammar") is not None and (tools or req.get("strata_mcp")):
+                raise ValueError("a grammar with tools/MCP is not supported")
+            if req.get("grammar") is not None and validator is not None:
+                raise ValueError("a grammar and response_format both constrain the answer; send one of them")
+            # A response_format the converter understands becomes the grammar too, so the answer is constrained rather
+            # than only checked afterwards. The validator still runs (oneOf exclusivity, and anything the converter
+            # left out); a schema it cannot express keeps the old path and no grammar is sent.
+            if req.get("grammar") is None and validator is not None and grammar_api.available(svc.engine):
+                auto = gbnf_api.for_response_format(req.get("response_format"))
+                if auto is not None:
+                    req = {**req, "grammar": auto}
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
@@ -8874,6 +8899,19 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
+            # a GBNF grammar (the request is also the sampling dict): the chat route's rules, as ResponsesError
+            try:
+                grammar_api.validate_request(req, svc.engine)
+                if req.get("grammar") is not None and (tools or req.get("strata_mcp")):
+                    raise ValueError("a grammar with tools/MCP is not supported")
+                if req.get("grammar") is not None and validator is not None:
+                    raise ValueError("a grammar and text.format both constrain the answer; send one of them")
+                if req.get("grammar") is None and validator is not None and grammar_api.available(svc.engine):
+                    auto = gbnf_api.for_response_format(responses_api.text_format(req))
+                    if auto is not None:
+                        req = {**req, "grammar": auto}
+            except ValueError as e:
+                raise ResponsesError(str(e), "grammar") from None
             svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
@@ -8924,6 +8962,11 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            # `grammar` is not part of Anthropic's schema, but the request is also the sampling dict: a client that
+            # sends one gets the same checks and the same constrained decoding as the OpenAI route.
+            grammar_api.validate_request(req, svc.engine)
+            if req.get("grammar") is not None and (tools or req.get("strata_mcp")):
+                raise ValueError("a grammar with tools/MCP is not supported")
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
