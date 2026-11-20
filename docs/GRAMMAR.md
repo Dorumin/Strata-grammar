@@ -25,9 +25,12 @@ The answer is exactly `yes` or `no`, whatever the temperature. A grammar is also
 uses under the hood when the engine can serve one, so most people never write one by hand (see
 [DETAILS.md](DETAILS.md), "JSON output").
 
-Thinking: a grammar constrains the **first generated token**, so a request that would open a thinking block gets none.
-Turn thinking off for grammar requests (`enable_thinking: false` as above) or the constrained text lands in the
-reasoning channel.
+Thinking: when the request would open a thinking block, the grammar does not start until the thinking is over. The
+model reasons freely — picks the topic, plans the answer — and the mask takes over exactly when the thinking closes, so
+the structured answer is still exact. This is the default, because a mask from the very first token would forbid the
+token that closes the thinking block, and a thinking model's answer would never begin. To have the grammar cover the
+whole output instead (thinking included), send `"strata_grammar_whole": true` with the request; with thinking off
+(`enable_thinking: false`) the two are the same.
 
 ## What works and what does not
 
@@ -41,7 +44,9 @@ reasoning channel.
   grammar; the engine still reads the prompt the same way.
 - Limits, all enforced in the engine: 64 KiB of grammar text, 262,144 grammar elements, nesting depth 128, 4,096 parse
   states, parse-stack depth 1,024. Past a limit the request fails with 400 and a message naming it; nothing hangs.
-- Only the first grammar body is supported: `lazy` grammars and trigger words are not exposed.
+- Trigger words and trigger patterns are not exposed: a grammar starts at the reply's first token, or (on a thinking
+  request) at the token after the thinking closes. A request can name other trigger tokens itself with
+  `strata_grammar_trigger` (a list of token ids); without it the think-end token is the trigger.
 - On an engine running with `--batch`/`--parallel`, a grammar request runs on the plain single-request path (other
   requests wait their turn); it is never moved into a batch slot, whose windows run ahead of the mask.
 
@@ -82,7 +87,10 @@ temperature 1, and 10 of 10 requests returned JSON that passed `jsonschema` agai
 
 ## The engine protocol
 
-The server sends `grammar=b64:<base64url>` (and optionally `grammar_root=<name>`) on the `GEN` line. The engine reads
+The server sends `grammar=b64:<base64url>` (and optionally `grammar_root=<name>`) on the `GEN` line. With
+`grammar_trigger=<id>,<id>` the grammar is lazy: it constrains nothing until one of those token ids is generated, and
+starts at the token after it (the trigger itself is never fed to the grammar). The engine reads
 the model's tokenizer from the GGUF metadata shard the first time a request carries a grammar (a few MB of pieces,
 once), then applies a full-vocabulary logit bias per step: `-inf` for every token the grammar refuses. The request's
-own `logit_bias` is kept on the tokens the grammar allows.
+own `logit_bias` is kept on the tokens the grammar allows. While a lazy grammar waits for its trigger, every ordinary
+token and the trigger token itself stay samplable; the end of generation still waits for the grammar to complete.

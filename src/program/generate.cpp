@@ -17124,6 +17124,12 @@ int main(int argc, char** argv) {
             std::string req_grammar_text;
             std::string req_grammar_root = "root";
             bool req_grammar_bad = false;
+            // ... and the token ids a LAZY grammar waits for (grammar_trigger=<id>,<id>): the mask constrains nothing
+            // until one of them is generated, so a thinking model's reasoning runs free before the structured answer
+            // (the server's think-then-answer; a request's "strata_grammar_whole": true turns it off).  The trigger
+            // itself is a boundary the grammar never sees: the root starts at the token after it.
+            std::vector<int32_t> req_grammar_triggers;
+            bool req_grammar_trigger_bad = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -17175,6 +17181,25 @@ int main(int argc, char** argv) {
                         }
                     }
                     else if (key == "grammar_root") req_grammar_root = tok.substr(eq + 1);
+                    else if (key == "grammar_trigger") {
+                        req_grammar_triggers.clear();
+                        const std::string csv = tok.substr(eq + 1);
+                        size_t p = 0;
+                        bool ids_ok = !csv.empty();
+                        while (ids_ok && p < csv.size()) {
+                            const size_t c = csv.find(",", p);
+                            const std::string one = csv.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                            char* e = nullptr;
+                            const long long v = std::strtoll(one.c_str(), &e, 10);
+                            if (one.empty() || e != one.c_str() + one.size() || v < 0 || v > 0x7fffffffLL)
+                                ids_ok = false;
+                            else
+                                req_grammar_triggers.push_back((int32_t) v);
+                            if (c == std::string::npos) break;
+                            p = c + 1;
+                        }
+                        if (!ids_ok) { req_grammar_triggers.clear(); req_grammar_trigger_bad = true; }
+                    }
                     else if (key == "min_p") req_min_p = fv;
                     else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
@@ -17228,9 +17253,18 @@ int main(int argc, char** argv) {
             std::unique_ptr<strata::grammar::Grammar> req_grammar;
             std::vector<uint8_t> req_grammar_allowed;   // 1/0 per token id: reused every round
             std::vector<float> req_grammar_bias;        // the request's bias, or zeros, widened to the vocabulary
-            if (!req_grammar_text.empty() || req_grammar_bad) {
+            if (!req_grammar_text.empty() || req_grammar_bad || req_grammar_trigger_bad ||
+                !req_grammar_triggers.empty()) {
                 if (req_grammar_bad) {
                     std::printf("ERR grammar: the value must be b64:<base64url>\n");
+                    continue;
+                }
+                if (req_grammar_trigger_bad) {
+                    std::printf("ERR grammar_trigger: the value must be comma-separated token ids\n");
+                    continue;
+                }
+                if (req_grammar_text.empty()) {
+                    std::printf("ERR grammar_trigger: the key needs a grammar=b64: on the same request\n");
                     continue;
                 }
                 if (!grammar_supported) {
@@ -17252,8 +17286,18 @@ int main(int argc, char** argv) {
                         continue;
                     }
                 }
+                bool triggers_ok = true;
+                for (const int32_t id : req_grammar_triggers) {
+                    if (id < 0 || id >= grammar_vocab.n_vocab) {
+                        std::printf("ERR grammar_trigger: token id %d is outside the vocabulary (%d)\n",
+                                    id, grammar_vocab.n_vocab);
+                        triggers_ok = false;
+                    }
+                }
+                if (!triggers_ok) continue;
                 std::string gerr;
-                req_grammar = strata::grammar::Grammar::parse(req_grammar_text, req_grammar_root, grammar_vocab, gerr);
+                req_grammar = strata::grammar::Grammar::parse(req_grammar_text, req_grammar_root, grammar_vocab, gerr,
+                                                              req_grammar_triggers);
                 if (!req_grammar) {
                     std::printf("ERR grammar: %s\n", gerr.c_str());
                     continue;

@@ -100,6 +100,10 @@ static std::shared_ptr<const llama_grammar_decoded> shared_decode_table(const Gr
 // point into its rules) and the carried-over partial UTF-8.
 static std::string state_key(const llama_grammar& g) {
     std::string key;
+    // The lazy state is part of the state: a grammar waiting for its trigger and a grammar just triggered over the
+    // same token have the same stacks (the trigger is not consumed), but the first allows everything and the second
+    // must mask from the root's start.
+    key.push_back(g.awaiting_trigger ? '\x02' : '\x01');
     for (const auto& stack : g.stacks) {
         key.reserve(key.size() + stack.size() * sizeof(const llama_grammar_element*) + 8);
         for (const auto* e : stack) {
@@ -133,7 +137,7 @@ Grammar::~Grammar() {
 }
 
 std::unique_ptr<Grammar> Grammar::parse(const std::string& gbnf, const std::string& root, const GrammarVocab& vocab,
-                                        std::string& err) {
+                                        std::string& err, const std::vector<int32_t>& trigger_tokens) {
     err.clear();
     if (gbnf.empty()) {
         err = "grammar is empty";
@@ -150,9 +154,12 @@ std::unique_ptr<Grammar> Grammar::parse(const std::string& gbnf, const std::stri
     if (!check_nesting(gbnf, kMaxNesting, err)) return nullptr;
 
     // init_impl logs its own reason (parse error, missing root, left recursion); the request gets one clear message.
+    const std::vector<llama_token> triggers(trigger_tokens.begin(), trigger_tokens.end());
     llama_grammar* g = llama_grammar_init_impl(&vocab, gbnf.c_str(), root.c_str(),
-                                               /*lazy=*/false, /*trigger_patterns=*/nullptr, /*num_trigger_patterns=*/0,
-                                               /*trigger_tokens=*/nullptr, /*num_trigger_tokens=*/0);
+                                               /*lazy=*/!triggers.empty(),
+                                               /*trigger_patterns=*/nullptr, /*num_trigger_patterns=*/0,
+                                               /*trigger_tokens=*/triggers.empty() ? nullptr : triggers.data(),
+                                               /*num_trigger_tokens=*/triggers.size());
     if (g == nullptr) {
         err = "grammar does not parse, has no '" + root + "' rule, or is left-recursive";
         return nullptr;

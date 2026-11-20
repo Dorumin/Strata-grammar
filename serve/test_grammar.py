@@ -108,6 +108,66 @@ class Gbnf(unittest.TestCase):
         self.assertIsNone(for_response_format(bad))    # keeps prompt-then-validate
 
 
+THINK_END_TEXT = b"\x3c\x2f\x74\x68\x69\x6e\x6b\x3e".decode("ascii")   # the think-end marker, from bytes:
+                                                                        # a literal of it does not survive editing
+
+
+class ThinkTok(ByteTokenizer):
+    """ByteTokenizer with the think-end token, so the lazy grammar's trigger has a single id to wait for."""
+    SPECIALS = ByteTokenizer.SPECIALS + [THINK_END_TEXT]
+
+
+class ThinkThenAnswer(unittest.TestCase):
+    """prepare() attaches the lazy grammar's trigger on a thinking request; the opt-out and the other
+    gates (no thinking, no single-token think-end, no grammar engine) leave the whole-output mask as it was."""
+
+    def prepare(self, tok, req, kwargs=None):
+        engine = MockEngine(tok, "ok", max_context=4096)
+        engine.can_grammar = True
+        service = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        messages = [{"role": "user", "content": "hi"}]
+        return service.prepare(messages, None, kwargs if kwargs is not None else req, 4, req=req)
+
+    def test_trigger_on_thinking(self):
+        tok = ThinkTok()
+        req = {"grammar": 'root ::= "a"'}
+        _, thinking, _ = self.prepare(tok, req)
+        self.assertTrue(thinking)
+        self.assertEqual(req.get("strata_grammar_trigger"), [tok.encode(THINK_END_TEXT, parse_special=True)[0]])
+        self.assertIn(" grammar_trigger=" + str(262), StrataEngine.sampling_keys(req))
+
+    def test_opt_out_whole_output(self):
+        tok = ThinkTok()
+        req = {"grammar": 'root ::= "a"', "strata_grammar_whole": True}
+        self.prepare(tok, req)
+        self.assertNotIn("strata_grammar_trigger", req)
+
+    def test_no_thinking(self):
+        tok = ThinkTok()
+        req = {"grammar": 'root ::= "a"'}
+        _, thinking, _ = self.prepare(tok, req, {"enable_thinking": False})
+        self.assertFalse(thinking)
+        self.assertNotIn("strata_grammar_trigger", req)
+
+    def test_no_single_token_think_end(self):
+        req = {"grammar": 'root ::= "a"'}     # ByteTokenizer has no think-end special: the trigger cannot fire
+        self.prepare(ByteTokenizer(), req)
+        self.assertNotIn("strata_grammar_trigger", req)
+
+    def test_engine_without_grammar(self):
+        tok = ThinkTok()
+        engine = MockEngine(tok, "ok", max_context=4096)      # no can_grammar: no trigger, no key
+        service = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        req = {"grammar": 'root ::= "a"'}
+        service.prepare([{"role": "user", "content": "hi"}], None, req, 4, req=req)
+        self.assertNotIn("strata_grammar_trigger", req)
+
+    def test_bad_trigger_value_is_dropped(self):
+        for value in [[-1], [True], ["262"], [1.5], 262, "262"]:
+            req = {"grammar": 'root ::= "a"', "strata_grammar_trigger": value}
+            self.assertNotIn(" grammar_trigger", StrataEngine.sampling_keys(req))
+
+
 class GrammarHttp(unittest.TestCase):
     def test_rejected_before_stream(self):
         tok = ByteTokenizer()

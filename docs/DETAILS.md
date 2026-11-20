@@ -549,7 +549,8 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
   work and remote ones are refused. On a CUDA/HIP engine with a native pack, a `json_schema` the converter understands is
   also turned into a GBNF grammar and the engine masks every token the grammar refuses, so the answer is valid by
-  construction; the validator still runs. A schema with `pattern`, `format`, numeric or length bounds,
+  construction; the validator still runs. On a request that thinks, the grammar starts only after the thinking closes,
+  so the reasoning runs free and the answer alone is constrained (see [GRAMMAR.md](GRAMMAR.md)). A schema with `pattern`, `format`, numeric or length bounds,
   `additionalProperties` schemas, remote references or more than four optional properties is not converted: it keeps prompt
   then validation. `json_object` always keeps prompt then validation, because "any JSON object" needs arbitrary keys and a
   grammar that allows any key can repeat one. A raw GBNF `grammar` string is accepted on both routes

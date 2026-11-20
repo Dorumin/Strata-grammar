@@ -1667,6 +1667,11 @@ class StrataEngine:
                 # only these ids are printed; the engine's comma-separated list, renormalised below
                 keys += " allowed=" + ",".join(str(i) for i in ids)
         # a GBNF grammar (constrained decoding): the engine masks every token the grammar refuses
+        # ... and its lazy trigger (think-then-answer): the mask starts only when one of these token ids arrives
+        trigger = sampling.get("strata_grammar_trigger")
+        if isinstance(trigger, list) and trigger and all(
+                isinstance(i, int) and not isinstance(i, bool) and 0 <= i <= 0x7FFFFFFF for i in trigger):
+            keys += " grammar_trigger=" + ",".join(str(i) for i in trigger)
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias")) \
             + grammar_api.engine_key(sampling.get("grammar"))
 
@@ -6097,7 +6102,18 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        thinking = kwargs.get("enable_thinking", True) is not False
+        # Think-then-answer for a grammar (serve/grammar.py): a mask from the reply's first token forbids the
+        # think-end token (specials are never grammar candidates), so the think block could never close -- the whole
+        # reply read as reasoning, the structured validator left with nothing.  When thinking runs, the grammar goes
+        # to the engine lazy, triggered by the think-end token: the reasoning runs free and the mask starts at the
+        # answer.  "strata_grammar_whole": true opts back into the whole-output mask.
+        if req is not None and thinking and req.get("grammar") is not None \
+                and not req.get("strata_grammar_whole") and grammar_api.available(self.engine):
+            te = self.tok.encode(THINK_END, parse_special=True)
+            if len(te) == 1:                   # the same gate the thinking budget's hold uses (a one-token boundary)
+                req["strata_grammar_trigger"] = [te[0]]
+        return ids, thinking, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 

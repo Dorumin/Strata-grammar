@@ -18,8 +18,13 @@ class Grammar {
 public:
     // Parses `gbnf` with `root` as the start rule.  nullptr with `err` set when the text does not parse, is
     // left-recursive, or is over one of the limits below.  `vocab` must outlive the Grammar.
+    //
+    // `trigger_tokens` makes the grammar lazy: until one of these token ids is generated the mask constrains
+    // nothing (the thinking part of a reply runs free), and the grammar takes over from the token AFTER the
+    // trigger.  The trigger itself is a protocol boundary the grammar never sees.  The trigger token ids stay
+    // samplable the whole time, or the grammar could never fire.
     static std::unique_ptr<Grammar> parse(const std::string& gbnf, const std::string& root, const GrammarVocab& vocab,
-                                          std::string& err);
+                                          std::string& err, const std::vector<int32_t>& trigger_tokens = {});
     ~Grammar();
 
     Grammar(const Grammar&) = delete;

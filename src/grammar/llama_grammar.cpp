@@ -1454,6 +1454,12 @@ bool llama_grammar_fill_allowed(const struct llama_grammar & grammar, const llam
                 allowed[id] = (vocab.is_eog(id) ? allow_eog : !vocab.is_special(id)) ? 1 : 0;
             }
         }
+        // Strata: the trigger token is usually a special token (the chat's think-end, say), and the free mask above
+        // allows only ordinary text.  The trigger has to stay samplable or a lazy grammar could never fire, so the
+        // trigger ids are allowed here on top of the free text.
+        for (const int32_t id : grammar.trigger_tokens) {
+            if (id >= 0 && id < static_cast<int32_t>(allowed.size())) allowed[static_cast<size_t>(id)] = 1;
+        }
         return true;
     }
 
@@ -1603,7 +1609,10 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
         if (std::find(grammar.trigger_tokens.begin(), grammar.trigger_tokens.end(), token) != grammar.trigger_tokens.end()) {
             grammar.awaiting_trigger = false;
             grammar.trigger_buffer.clear();
-            llama_grammar_accept_token(grammar, token, piece);
+            // Strata deviation from upstream (pin 3cf03257): the trigger token is NOT fed to the grammar.  Upstream
+            // accepts it, so the grammar's root has to match the trigger's own text; Strata's trigger is a protocol
+            // boundary (the chat's think-end, say) that the structured answer must follow, not be part of.  The
+            // grammar starts matching from the next token.
             LLAMA_LOG_DEBUG("Grammar triggered on token %u (`%s`)", token, piece.c_str());
             return;
         } else {

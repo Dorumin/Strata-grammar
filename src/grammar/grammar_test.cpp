@@ -219,6 +219,48 @@ void test_eog_only_when_complete() {
     CHECK(allowed_at(a, 2));
 }
 
+void test_lazy_trigger() {
+    // The think-then-answer shape: the grammar waits for a trigger token (the chat's think-end, say), the thinking
+    // runs free, and the mask starts at the token AFTER the trigger -- which the grammar itself never sees.
+    // 0 = <eog>, 1 = "<end>" (the trigger), 2 "{", 3 "a", 4 "}", 5 "x".
+    const GrammarVocab v = make_vocab({"", "<end>", "{", "a", "}", "x"});
+    std::string err;
+    auto g = Grammar::parse("root ::= \"{\" \"a\" \"}\"", "root", v, err, {1});
+    CHECK(g != nullptr);
+    if (!g) return;
+    CHECK(!g->complete());
+
+    std::vector<uint8_t> a;
+    CHECK(g->fill_allowed(a, err));
+    // While waiting, every ordinary piece is allowed -- the thinking runs free -- and the trigger token itself too.
+    CHECK(allowed_at(a, 1));
+    CHECK(allowed_at(a, 2));
+    CHECK(allowed_at(a, 5));
+    CHECK(!allowed_at(a, 0));  // EOG still waits for the grammar
+
+    // Ordinary tokens pass through without touching the grammar.
+    CHECK(g->accept(5, err));
+    CHECK(g->fill_allowed(a, err));
+    CHECK(allowed_at(a, 2));
+    CHECK(allowed_at(a, 1));
+
+    // The trigger fires the grammar without being consumed: the root's "{" must start right after it.
+    CHECK(g->accept(1, err));
+    CHECK(!g->complete());
+    CHECK(g->fill_allowed(a, err));
+    CHECK(allowed_at(a, 2));
+    CHECK(!allowed_at(a, 5));  // the mask now holds
+    CHECK(!allowed_at(a, 1));  // the trigger was a boundary, not part of the answer
+
+    CHECK(g->accept(2, err));
+    CHECK(g->accept(3, err));
+    CHECK(g->accept(4, err));
+    CHECK(g->complete());
+    CHECK(g->fill_allowed(a, err));
+    CHECK(allowed_at(a, 0));
+    CHECK(!allowed_at(a, 2));
+}
+
 // The real model's metadata shard, when one is given: the pieces, the byte decoder, the EOG ids and a JSON grammar
 // over the full vocabulary.  This is the part a synthetic vocabulary cannot check -- a GPT-2 piece table decoded
 // wrongly still has the right ids, so only the real file shows it.
@@ -292,6 +334,7 @@ int main(int argc, char** argv) {
     test_stuck_grammar();
     test_multibyte_piece();
     test_eog_only_when_complete();
+    test_lazy_trigger();
     if (argc > 1) test_real_vocab(argv[1]);
 
     if (g_failures == 0) {
